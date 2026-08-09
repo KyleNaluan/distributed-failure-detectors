@@ -1,93 +1,71 @@
-# Configuration Guide
+# Distributed Failure Detectors
 
-This document explains the configuration files used by the failure detector system and how to set them up for local testing and Chameleon Cloud deployment.
+A comparison of heartbeat-based failure detection algorithms for distributed systems, evaluated on real infrastructure under controlled network conditions.
 
----
+## Overview
 
-## config_ci_10.yaml
+This project implements and empirically compares four failure detector algorithms:
 
-The main experiment configuration file. It is committed to the repository and defines all experiment parameters including node addresses, heartbeat timing, detector thresholds, and log/results directories.
+- **Fixed Timeout** - the classical baseline.
+  A peer is declared failed if no heartbeat has been received within a fixed time window.
+- **Adaptive Timeout** - the timeout threshold adapts to recent network behavior.
+  It is computed as the mean plus `k` standard deviations of recent heartbeat inter-arrival intervals.
+- **Phi Accrual** - based on Hayashibara et al.'s Phi Accrual Failure Detector (used in systems like Cassandra and Akka).
+  Instead of a binary alive/dead timeout, it computes a continuous suspicion level (phi) from a statistical model of heartbeat arrival times, and flags failure once phi crosses a threshold.
+- **Confidence Interval** - a statistical detector developed for this project.
+  It computes a confidence interval on the mean heartbeat gap and flags failure once the lower bound of that interval exceeds a threshold.
 
-### Node IP Addresses
+Each node runs all four detectors simultaneously against the same live heartbeat stream, so their behavior can be compared directly under identical conditions.
 
-The `nodes` section defines the identity and address of each node in the cluster. For local testing, all five nodes use `127.0.0.1` (localhost) with different ports. For Chameleon deployment, the `host` field for each node must be replaced with the private IP assigned to that node on the `failure-detector-net` isolated VLAN interface.
+## What counts as a "failure" here
 
-```yaml
-nodes:
-  - node_id: node-1
-    host: 127.0.0.1
-    port: 5001
-  - node_id: node-2
-    host: 127.0.0.1
-    port: 5002
-  - node_id: node-3
-    host: 127.0.0.1
-    port: 5003
-  - node_id: node-4
-    host: 127.0.0.1
-    port: 5004
-  - node_id: node-5
-    host: 127.0.0.1
-    port: 5005
+Failures in this system are **crash-stop node failures**: a node simply stops sending heartbeats.
+In the experiment harness, this is simulated by stopping that node's heartbeat-sending thread (not by killing the whole process), which lets the fault injector trigger crash and recovery at precise, scripted times.
+
+Nodes communicate directly over real UDP sockets in a full mesh (every node heartbeats to every other node).
+A separate network simulation layer can inject artificial packet loss, delay, and jitter on top of the real network path, which is used to test whether each detector can tell a genuine crash apart from a congested but still-alive peer.
+
+## How to run
+
+Dependencies: `numpy` and `pyyaml` (no `requirements.txt` is currently checked in, install with `pip install numpy pyyaml`).
+
+The system is designed to run as one process per physical node (see `config_ci_10.yaml` for the 5-node address list; edit `host` values for your environment, or leave them all as `127.0.0.1` with distinct ports for local testing).
+
+On each node:
+
 ```
-> **Important:** The same `config_ci_10.yaml` must be deployed to all five nodes with identical content. Every node needs the full list of all five node addresses so it can add the others as peers.
-
-### Other Parameters
-
-The remaining parameters in `config_ci_10.yaml` are tuned and should not need to be changed for Chameleon deployment:
-
-- `heartbeat.interval` — how often each node sends heartbeats (1.0s)
-- `heartbeat.check_interval` — how often detectors check for failures (0.5s)
-- `detectors` — threshold and window size parameters for each of the four detectors
-- `logs.directory` — where experiment log files are written on each node
-
----
-
-## config_ci_20.yaml and config_ci_30.yaml
-
-These are supplementary configs used for the CI-FD window size comparison experiment. They are identical to `config_ci_10.yaml` except for `confidence_interval.window_size` (20 and 30 respectively) and `logs.directory` (pointing to `logs_ci_20/` and `logs_ci_30/` to keep runs separate).
-
-When running these on Chameleon, update the node `host` fields in the same way as `config_ci_10.yaml`.
-
----
-
-## collection_config.yaml
-
-This file is **not in the repository** — it is listed in `.gitignore` and must be created manually on your local machine before collecting logs from Chameleon nodes.
-
-### Why it is not committed
-
-`collection_config.yaml` contains a SSH private key path and the floating IPs of the Chameleon nodes. Floating IPs change every time a new lease is created, so the file would be stale immediately after any lease renewal. More importantly, exposing SSH key paths alongside node addresses in a public or shared repository is a security risk. For these reasons the file is intentionally excluded from version control.
-
-### Format
-
-Create `collection_config.yaml` in the project root with the following structure:
-
-```yaml
-ssh_key: ~/.ssh/your-key.pem
-
-nodes:
-  - node_id: node-1
-    floating_ip: 129.xxx.xxx.xxx
-  - node_id: node-2
-    floating_ip: 129.xxx.xxx.xxx
-  - node_id: node-3
-    floating_ip: 129.xxx.xxx.xxx
-  - node_id: node-4
-    floating_ip: 129.xxx.xxx.xxx
-  - node_id: node-5
-    floating_ip: 129.xxx.xxx.xxx
+python main.py --config config_ci_10.yaml --node node-1 --start-time <unix_timestamp>
 ```
 
-### What goes in each field
+`--start-time` lets all nodes begin the scenario sequence at the same wall-clock time.
+Each run steps through 11 predefined scenarios (`experiments/scenarios.py`): a stable baseline, single and rolling node crashes, three levels of network congestion (with and without a simultaneous crash), and a short congestion spike-and-recovery. Each node writes its own event log as JSON to `logs/`.
 
-- `ssh_key` — path to the `.pem` file downloaded when creating a Chameleon key pair. On Windows use a full path like `C:/Users/yourname/.ssh/your-key.pem`.
-- `floating_ip` — the public floating IP associated with each node's `sharednet1` interface. Find these under Network → Floating IPs in the Chameleon dashboard. These are the IPs are used to SSH into each node, not the private `failure-detector-net` IPs.
+After collecting logs from all nodes (`scripts/collect_logs.py` if running on Chameleon Cloud, or just gather local `logs/` directories), merge and analyze them:
 
-### Usage
+```
+python scripts/merge_logs.py
+python scripts/run_analysis.py
+```
 
-`collection_config.yaml` is read by `scripts/collect_logs.py` after experiments finish. It tells the script which nodes to connect to and how to authenticate:
+This produces `results/results.csv` with, per detector per scenario: false-positive rate, average detection time, and mistake rate (false positives per minute).
 
-python scripts/collect_logs.py
+## What this demonstrates
 
-This pulls each node's log files to a local machine into `logs/{node_id}/` directories, after which `scripts/merge_logs.py` and `analyze.py` can be run to produce results.
+- Implementation of a well-known accrual failure detector (Phi Accrual) alongside classical and custom statistical alternatives, evaluated under the same conditions rather than in isolation.
+- Real distributed communication: independent processes on independent (or independently-addressed) nodes exchanging UDP heartbeats, synchronized to a shared start time, rather than a single-process simulation.
+- Deliberate separation of "real" node failure (thread/process level) from "simulated" network degradation (packet loss, delay, jitter), so detector accuracy can be attributed to the right cause.
+- An end-to-end experimental methodology: scripted fault scenarios, per-node event logging, cross-node log merging, and quantitative metrics (false positive rate, detection latency, mistake rate) rather than just a working demo.
+- Deployment onto Chameleon Cloud (an NSF-funded distributed systems research testbed) via an isolated VLAN, with a separate, gitignored config for SSH-based log collection.
+
+## Repository layout
+
+- `common/` - node model, UDP heartbeat sender/listener, event recorder
+- `detectors/` - the four failure detector implementations
+- `simulation/` - network fault injection (loss/delay/jitter) and crash/recover injection
+- `experiments/` - scenario definitions and the per-node experiment runner
+- `analysis/` - metrics computation and CSV report generation
+- `scripts/` - log collection, merging, and analysis entrypoints for multi-node runs
+
+## Note on the existing README
+
+`README.md` in this repo is a "Configuration Guide" for the YAML config files, useful, but it assumes the reader already knows what the project is. This document is meant to replace/supplement it as the primary landing-page explanation; keep the configuration guide content as a secondary section or a linked doc.
